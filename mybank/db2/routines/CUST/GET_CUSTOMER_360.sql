@@ -1,0 +1,120 @@
+-- Single customer view for the teller and web app: returns 3 result sets
+--   1) customer, current home address and contacts  2) accounts held  3) recent activity.
+-- Raises 75004 customer not found, 75008 bad row count.
+CREATE OR REPLACE PROCEDURE CUST.GET_CUSTOMER_360 (
+    IN P_CUSTOMER_ID BIGINT,
+    IN P_TXN_ROWS    SMALLINT
+)
+    LANGUAGE SQL
+    SPECIFIC CUST_GET_CUSTOMER_360
+    DYNAMIC RESULT SETS 3
+    READS SQL DATA
+BEGIN
+    DECLARE V_COUNT INTEGER DEFAULT 0;
+    DECLARE V_ROWS  SMALLINT;
+
+    DECLARE C_CUSTOMER CURSOR WITH RETURN TO CLIENT FOR
+        SELECT C.CUSTOMER_ID,
+               C.CUSTOMER_NO,
+               C.TITLE,
+               C.FIRST_NAME,
+               C.LAST_NAME,
+               C.DATE_OF_BIRTH,
+               YEAR(UTIL.CURRENT_BUSINESS_DATE() - C.DATE_OF_BIRTH) AS AGE,
+               C.NI_NUMBER,
+               C.SEGMENT,
+               C.STATUS,
+               C.KYC_STATUS,
+               C.RISK_RATING,
+               C.HOME_BRANCH_ID,
+               B.NAME AS HOME_BRANCH_NAME,
+               C.OPENED_DATE,
+               C.CLOSED_DATE,
+               A.LINE1,
+               A.LINE2,
+               A.TOWN,
+               A.POSTCODE,
+               MAX(CASE WHEN K.CONTACT_TYPE = 'EMAIL' THEN K.CONTACT_VALUE END) AS EMAIL,
+               MAX(CASE WHEN K.CONTACT_TYPE = 'MOBIL' THEN K.CONTACT_VALUE END) AS MOBILE,
+               MAX(CASE WHEN K.CONTACT_TYPE = 'HOMEP' THEN K.CONTACT_VALUE END) AS HOME_PHONE,
+               (SELECT MAX(KC.CHECKED_TS) FROM CUST.KYC_CHECK KC
+                 WHERE KC.CUSTOMER_ID = C.CUSTOMER_ID) AS LAST_KYC_TS,
+               (SELECT COUNT(*) FROM RISK.FRAUD_ALERT F
+                  JOIN ACCT.ACCOUNT_HOLDER H ON H.ACCOUNT_ID = F.ACCOUNT_ID
+                 WHERE H.CUSTOMER_ID = C.CUSTOMER_ID AND F.STATUS = 'O') AS OPEN_ALERTS
+          FROM CUST.CUSTOMER C
+          JOIN REF.BRANCH B ON B.BRANCH_ID = C.HOME_BRANCH_ID
+          LEFT JOIN CUST.ADDRESS A
+                 ON A.CUSTOMER_ID = C.CUSTOMER_ID
+                AND A.ADDRESS_TYPE = 'H'
+                AND A.VALID_TO IS NULL
+          LEFT JOIN CUST.CONTACT K ON K.CUSTOMER_ID = C.CUSTOMER_ID
+         WHERE C.CUSTOMER_ID = P_CUSTOMER_ID
+         GROUP BY C.CUSTOMER_ID, C.CUSTOMER_NO, C.TITLE, C.FIRST_NAME, C.LAST_NAME,
+                  C.DATE_OF_BIRTH, C.NI_NUMBER, C.SEGMENT, C.STATUS, C.KYC_STATUS,
+                  C.RISK_RATING, C.HOME_BRANCH_ID, B.NAME, C.OPENED_DATE, C.CLOSED_DATE,
+                  A.LINE1, A.LINE2, A.TOWN, A.POSTCODE
+          WITH UR;
+
+    DECLARE C_ACCOUNTS CURSOR WITH RETURN TO CLIENT FOR
+        SELECT S.ACCOUNT_ID,
+               UTIL.FORMAT_SORT_CODE(S.SORT_CODE) AS SORT_CODE,
+               S.ACCOUNT_NO,
+               S.ACCOUNT_NAME,
+               S.PRODUCT_CODE,
+               S.PRODUCT_NAME,
+               S.PRODUCT_TYPE,
+               H.HOLDER_ROLE,
+               S.STATUS,
+               S.LEDGER_BALANCE,
+               S.HOLD_AMOUNT,
+               S.OVERDRAFT_LIMIT,
+               S.AVAILABLE_BALANCE,
+               S.LAST_ACTIVITY_DATE,
+               S.OPENED_DATE,
+               (SELECT COUNT(*) FROM CARD.CARD K
+                 WHERE K.ACCOUNT_ID = S.ACCOUNT_ID AND K.STATUS = 'A') AS ACTIVE_CARDS
+          FROM ACCT.ACCOUNT_HOLDER H
+          JOIN ACCT.V_ACCOUNT_SUMMARY S ON S.ACCOUNT_ID = H.ACCOUNT_ID
+         WHERE H.CUSTOMER_ID = P_CUSTOMER_ID
+         ORDER BY CASE S.STATUS WHEN 'C' THEN 1 ELSE 0 END, S.PRODUCT_TYPE, S.OPENED_DATE
+          WITH UR;
+
+    DECLARE C_ACTIVITY CURSOR WITH RETURN TO CLIENT FOR
+        SELECT T.TXN_ID,
+               T.ACCOUNT_ID,
+               A.ACCOUNT_NO,
+               T.BUSINESS_DATE,
+               T.POSTED_TS,
+               T.TXN_TYPE,
+               T.DESCRIPTION,
+               T.AMOUNT,
+               T.BALANCE_AFTER,
+               T.CHANNEL
+          FROM ACCT.ACCOUNT_HOLDER H
+          JOIN ACCT.ACCOUNT A ON A.ACCOUNT_ID = H.ACCOUNT_ID
+          JOIN TXN.POSTED_TXN T ON T.ACCOUNT_ID = H.ACCOUNT_ID
+         WHERE H.CUSTOMER_ID = P_CUSTOMER_ID
+           AND T.BUSINESS_DATE >= UTIL.CURRENT_BUSINESS_DATE() - 30 DAYS
+         ORDER BY T.POSTED_TS DESC, T.TXN_ID DESC
+         FETCH FIRST V_ROWS ROWS ONLY
+          WITH UR;
+
+    SELECT COUNT(*) INTO V_COUNT
+      FROM CUST.CUSTOMER
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+      WITH UR;
+
+    IF V_COUNT = 0 THEN
+        SIGNAL SQLSTATE '75004' SET MESSAGE_TEXT = 'Customer not found';
+    END IF;
+
+    SET V_ROWS = COALESCE(P_TXN_ROWS, 20);
+    IF V_ROWS < 1 OR V_ROWS > 200 THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Activity rows must be between 1 and 200';
+    END IF;
+
+    OPEN C_CUSTOMER;
+    OPEN C_ACCOUNTS;
+    OPEN C_ACTIVITY;
+END@

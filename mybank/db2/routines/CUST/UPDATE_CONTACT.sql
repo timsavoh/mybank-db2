@@ -1,0 +1,127 @@
+-- Changes a customer's contact details. NULL leaves a value unchanged, '' removes it.
+-- A new address end-dates the current home address. Called by the app (profile screens).
+-- Raises 75004 customer not found or closed, 75008 invalid email/phone/address.
+CREATE OR REPLACE PROCEDURE CUST.UPDATE_CONTACT (
+    IN  P_CUSTOMER_ID    BIGINT,
+    IN  P_EMAIL          VARCHAR(120),
+    IN  P_MOBILE         VARCHAR(120),
+    IN  P_HOME_PHONE     VARCHAR(120),
+    IN  P_ADDRESS_LINE1  VARCHAR(60),
+    IN  P_ADDRESS_LINE2  VARCHAR(60),
+    IN  P_TOWN           VARCHAR(40),
+    IN  P_POSTCODE       VARCHAR(8),
+    OUT P_ROWS_CHANGED   INTEGER
+)
+    LANGUAGE SQL
+    SPECIFIC CUST_UPDATE_CONTACT
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+    DECLARE V_STATUS   CHAR(1);
+    DECLARE V_ROWS     INTEGER DEFAULT 0;
+    DECLARE V_BDATE    DATE;
+    DECLARE V_EMAIL    VARCHAR(120);
+    DECLARE V_MOBILE   VARCHAR(120);
+    DECLARE V_HOMEP    VARCHAR(120);
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.LOG_ERROR('CUST.UPDATE_CONTACT', V_SQLSTATE, V_SQLCODE, V_MSG,
+                            'CUSTOMER_ID=' || COALESCE(RTRIM(CHAR(P_CUSTOMER_ID)), 'NULL'));
+        RESIGNAL;
+    END;
+
+    SET P_ROWS_CHANGED = 0;
+
+    SELECT STATUS INTO V_STATUS
+      FROM CUST.CUSTOMER
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID;
+
+    IF V_STATUS IS NULL OR V_STATUS = 'C' THEN
+        SIGNAL SQLSTATE '75004' SET MESSAGE_TEXT = 'Customer not found or closed';
+    END IF;
+
+    -- Normalise and validate
+    SET V_EMAIL  = LOWER(RTRIM(LTRIM(P_EMAIL)));
+    SET V_MOBILE = REPLACE(REPLACE(RTRIM(LTRIM(P_MOBILE)), ' ', ''), '-', '');
+    SET V_HOMEP  = REPLACE(REPLACE(RTRIM(LTRIM(P_HOME_PHONE)), ' ', ''), '-', '');
+
+    IF V_EMAIL <> '' AND (LOCATE('@', V_EMAIL) < 2 OR LOCATE('.', V_EMAIL, LOCATE('@', V_EMAIL)) = 0) THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Invalid email address';
+    END IF;
+    IF V_MOBILE <> '' AND (LENGTH(V_MOBILE) < 10
+                           OR TRANSLATE(V_MOBILE, '', '+0123456789') <> '') THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Invalid mobile number';
+    END IF;
+    IF V_HOMEP <> '' AND (LENGTH(V_HOMEP) < 10
+                          OR TRANSLATE(V_HOMEP, '', '+0123456789') <> '') THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Invalid home phone number';
+    END IF;
+
+    -- Upsert the supplied contacts; a changed value must be re-verified
+    MERGE INTO CUST.CONTACT T
+    USING (SELECT CONTACT_TYPE, CONTACT_VALUE
+             FROM TABLE (VALUES ('EMAIL', V_EMAIL),
+                                ('MOBIL', V_MOBILE),
+                                ('HOMEP', V_HOMEP)) AS X (CONTACT_TYPE, CONTACT_VALUE)
+            WHERE CONTACT_VALUE IS NOT NULL
+              AND CONTACT_VALUE <> '') S
+       ON T.CUSTOMER_ID = P_CUSTOMER_ID
+      AND T.CONTACT_TYPE = S.CONTACT_TYPE
+    WHEN MATCHED AND T.CONTACT_VALUE <> S.CONTACT_VALUE THEN
+        UPDATE SET CONTACT_VALUE = S.CONTACT_VALUE,
+                   VERIFIED      = 'N',
+                   UPDATED_TS    = CURRENT TIMESTAMP
+    WHEN NOT MATCHED THEN
+        INSERT (CUSTOMER_ID, CONTACT_TYPE, CONTACT_VALUE, VERIFIED, UPDATED_TS)
+        VALUES (P_CUSTOMER_ID, S.CONTACT_TYPE, S.CONTACT_VALUE, 'N', CURRENT TIMESTAMP);
+    GET DIAGNOSTICS V_ROWS = ROW_COUNT;
+    SET P_ROWS_CHANGED = P_ROWS_CHANGED + V_ROWS;
+
+    -- Empty string removes the contact
+    DELETE FROM CUST.CONTACT
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+       AND ((CONTACT_TYPE = 'EMAIL' AND V_EMAIL = '')
+         OR (CONTACT_TYPE = 'MOBIL' AND V_MOBILE = '')
+         OR (CONTACT_TYPE = 'HOMEP' AND V_HOMEP = ''));
+    GET DIAGNOSTICS V_ROWS = ROW_COUNT;
+    SET P_ROWS_CHANGED = P_ROWS_CHANGED + V_ROWS;
+
+    -- New home address: end-date the current one, keep the history
+    IF P_ADDRESS_LINE1 IS NOT NULL THEN
+        IF P_TOWN IS NULL OR P_POSTCODE IS NULL OR RTRIM(P_ADDRESS_LINE1) = '' THEN
+            SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Address needs line 1, town and postcode';
+        END IF;
+
+        SET V_BDATE = UTIL.CURRENT_BUSINESS_DATE();
+
+        UPDATE CUST.ADDRESS
+           SET VALID_TO = CASE WHEN VALID_FROM >= V_BDATE THEN VALID_FROM ELSE V_BDATE - 1 DAY END
+         WHERE CUSTOMER_ID = P_CUSTOMER_ID
+           AND ADDRESS_TYPE = 'H'
+           AND VALID_TO IS NULL;
+
+        INSERT INTO CUST.ADDRESS (CUSTOMER_ID, ADDRESS_TYPE, LINE1, LINE2, TOWN, POSTCODE, VALID_FROM)
+        VALUES (P_CUSTOMER_ID, 'H', P_ADDRESS_LINE1, P_ADDRESS_LINE2, P_TOWN, UPPER(P_POSTCODE), V_BDATE);
+        SET P_ROWS_CHANGED = P_ROWS_CHANGED + 1;
+    END IF;
+
+    IF P_ROWS_CHANGED > 0 THEN
+        CALL UTIL.WRITE_AUDIT('CUST.CONTACT', RTRIM(CHAR(P_CUSTOMER_ID)), 'U',
+                              'Contact details changed' ||
+                              CASE WHEN P_EMAIL IS NOT NULL THEN ' EMAIL' ELSE '' END ||
+                              CASE WHEN P_MOBILE IS NOT NULL THEN ' MOBILE' ELSE '' END ||
+                              CASE WHEN P_HOME_PHONE IS NOT NULL THEN ' HOMEP' ELSE '' END ||
+                              CASE WHEN P_ADDRESS_LINE1 IS NOT NULL THEN ' ADDRESS' ELSE '' END);
+
+        -- Security notice so the customer knows their details were changed
+        CALL UTIL.ENQUEUE_NOTIFICATION(P_CUSTOMER_ID, 'CONTACT_CHANGED',
+                                       '{"customerId":' || RTRIM(CHAR(P_CUSTOMER_ID)) || '}');
+    END IF;
+END@

@@ -1,0 +1,132 @@
+-- Month-end: pays/charges accrued interest. Posts ROUND(ACCRUED_INTEREST, 2) as INT (contra 2210
+-- for credit interest, 1210 for overdraft interest), leaves the sub-penny remainder accrued, then
+-- trues up the accrual GLs so 2210/1210 still equal the rounded sub-ledger. Re-run safe.
+CREATE OR REPLACE PROCEDURE BATCH.CAPITALISE_INTEREST (OUT P_ROWS_PROCESSED INTEGER)
+    LANGUAGE SQL
+    SPECIFIC BATCH_CAPITALISE_INTEREST
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+    DECLARE V_RUN_ID   BIGINT;
+    DECLARE V_ROWS     INTEGER DEFAULT 0;
+    DECLARE V_FAILED   INTEGER DEFAULT 0;
+    DECLARE V_EOF      SMALLINT DEFAULT 0;
+    DECLARE V_TODAY    DATE;
+    DECLARE V_REFERENCE VARCHAR(40);
+    DECLARE V_PAID     DECIMAL(17,2) DEFAULT 0;
+    DECLARE V_CHARGED  DECIMAL(17,2) DEFAULT 0;
+    DECLARE V_PAYABLE_ADJ    DECIMAL(15,2);
+    DECLARE V_RECEIVABLE_ADJ DECIMAL(15,2);
+
+    DECLARE V_ACCOUNT_ID BIGINT;
+    DECLARE V_ACCRUED    DECIMAL(15,6);
+    DECLARE V_AMOUNT     DECIMAL(15,2);
+    DECLARE V_CONTRA_GL  CHAR(4);
+    DECLARE V_DESCRIPTION VARCHAR(100);
+    DECLARE V_TXN_ID     BIGINT;
+    DECLARE V_BALANCE    DECIMAL(15,2);
+    DECLARE V_ROW_STATE  CHAR(5);
+    DECLARE V_ROW_CODE   INTEGER;
+    DECLARE V_ROW_MSG    VARCHAR(1000);
+
+    DECLARE C_ACCRUED CURSOR WITH HOLD FOR
+        SELECT A.ACCOUNT_ID, A.ACCRUED_INTEREST
+          FROM ACCT.ACCOUNT A
+         WHERE A.STATUS <> 'C'
+           AND ABS(A.ACCRUED_INTEREST) >= 0.005
+           AND A.PRODUCT_CODE IN (SELECT P.PRODUCT_CODE
+                                    FROM REF.PRODUCT P
+                                   WHERE P.PRODUCT_TYPE <> 'LON')
+         ORDER BY A.ACCOUNT_ID
+          WITH CS;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET V_EOF = 1;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.END_JOB_RUN(V_RUN_ID, 'F', V_ROWS, V_MSG);
+        CALL UTIL.LOG_ERROR('BATCH.CAPITALISE_INTEREST', V_SQLSTATE, V_SQLCODE, V_MSG,
+                            'ACCOUNT_ID=' || COALESCE(RTRIM(CHAR(V_ACCOUNT_ID)), '-'));
+        RESIGNAL;
+    END;
+
+    CALL UTIL.START_JOB_RUN('CAPITALISE_INTEREST', V_RUN_ID);
+    SET V_TODAY = UTIL.CURRENT_BUSINESS_DATE();
+    -- One reference per interest period; the period is named after the calendar month end
+    SET V_REFERENCE = 'INT' || VARCHAR_FORMAT(LAST_DAY(V_TODAY), 'YYYYMMDD');
+
+    OPEN C_ACCRUED;
+    CAP_LOOP:
+    LOOP
+        SET V_EOF = 0;
+        FETCH C_ACCRUED INTO V_ACCOUNT_ID, V_ACCRUED;
+        IF V_EOF = 1 THEN
+            LEAVE CAP_LOOP;
+        END IF;
+
+        SET V_AMOUNT = DECIMAL(ROUND(V_ACCRUED, 2), 15, 2);
+        IF V_AMOUNT > 0 THEN
+            SET V_CONTRA_GL = '2210';
+            SET V_DESCRIPTION = 'Credit interest to ' || VARCHAR_FORMAT(V_TODAY, 'DD Mon YYYY');
+        ELSE
+            SET V_CONTRA_GL = '1210';
+            SET V_DESCRIPTION = 'Overdraft interest to ' || VARCHAR_FORMAT(V_TODAY, 'DD Mon YYYY');
+        END IF;
+
+        SET V_ROW_STATE = '00000';
+        SAVEPOINT SP_CAP ON ROLLBACK RETAIN CURSORS;
+        CAP_BLOCK:
+        BEGIN
+            DECLARE EXIT HANDLER FOR SQLEXCEPTION
+            BEGIN
+                GET DIAGNOSTICS EXCEPTION 1 V_ROW_MSG = MESSAGE_TEXT;
+                VALUES (SQLSTATE, SQLCODE) INTO V_ROW_STATE, V_ROW_CODE;
+            END;
+
+            CALL UTIL.POST_LEDGER_ENTRY(V_ACCOUNT_ID, V_AMOUNT, 'INT', V_DESCRIPTION, V_REFERENCE,
+                                        V_CONTRA_GL, NULL, V_TODAY, 'Y',
+                                        NULL, NULL, NULL, NULL, NULL, V_TXN_ID, V_BALANCE);
+
+            -- Keep the sub-penny remainder for next month
+            UPDATE ACCT.ACCOUNT
+               SET ACCRUED_INTEREST = ACCRUED_INTEREST - V_AMOUNT
+             WHERE ACCOUNT_ID = V_ACCOUNT_ID;
+        END CAP_BLOCK;
+
+        IF V_ROW_STATE = '00000' THEN
+            RELEASE SAVEPOINT SP_CAP;
+            IF V_AMOUNT > 0 THEN
+                SET V_PAID = V_PAID + V_AMOUNT;
+            ELSE
+                SET V_CHARGED = V_CHARGED - V_AMOUNT;
+            END IF;
+            SET V_ROWS = V_ROWS + 1;
+        ELSE
+            -- e.g. overdraft interest on a frozen account: stays accrued until it thaws
+            ROLLBACK TO SAVEPOINT SP_CAP;
+            CALL UTIL.LOG_ERROR('BATCH.CAPITALISE_INTEREST', V_ROW_STATE, V_ROW_CODE, V_ROW_MSG,
+                                'ACCOUNT_ID=' || RTRIM(CHAR(V_ACCOUNT_ID)));
+            SET V_FAILED = V_FAILED + 1;
+        END IF;
+
+        IF MOD(V_ROWS + V_FAILED, 500) = 0 THEN
+            COMMIT;
+        END IF;
+    END LOOP CAP_LOOP;
+    CLOSE C_ACCRUED;
+
+    CALL BATCH.TRUE_UP_ACCRUAL_GL(V_TODAY, 'CAPITALISE_INTEREST', V_PAYABLE_ADJ, V_RECEIVABLE_ADJ);
+    COMMIT;
+
+    SET P_ROWS_PROCESSED = V_ROWS;
+    CALL UTIL.END_JOB_RUN(V_RUN_ID, 'S', V_ROWS,
+         RTRIM(CHAR(V_ROWS)) || ' accounts: credit interest paid ' || VARCHAR(V_PAID)
+         || ', overdraft interest charged ' || VARCHAR(V_CHARGED) || ', ' || RTRIM(CHAR(V_FAILED))
+         || ' failed; GL 2210 adj ' || VARCHAR(V_PAYABLE_ADJ) || ', 1210 adj ' || VARCHAR(V_RECEIVABLE_ADJ));
+END@

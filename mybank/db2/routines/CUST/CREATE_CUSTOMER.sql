@@ -1,0 +1,137 @@
+-- Onboards a new customer with optional home address and email/mobile contacts.
+-- Called by the app (branch and digital onboarding). OUT: new customer id and number.
+-- Raises 75007 NI number already registered, 75008 bad name/branch/NI, 75009 under 16.
+CREATE OR REPLACE PROCEDURE CUST.CREATE_CUSTOMER (
+    IN  P_TITLE          VARCHAR(10),
+    IN  P_FIRST_NAME     VARCHAR(50),
+    IN  P_LAST_NAME      VARCHAR(50),
+    IN  P_DATE_OF_BIRTH  DATE,
+    IN  P_NI_NUMBER      VARCHAR(13),
+    IN  P_BRANCH_ID      SMALLINT,
+    IN  P_EMAIL          VARCHAR(120),
+    IN  P_MOBILE         VARCHAR(120),
+    IN  P_ADDRESS_LINE1  VARCHAR(60),
+    IN  P_TOWN           VARCHAR(40),
+    IN  P_POSTCODE       VARCHAR(8),
+    OUT P_CUSTOMER_ID    BIGINT,
+    OUT P_CUSTOMER_NO    CHAR(8)
+)
+    LANGUAGE SQL
+    SPECIFIC CUST_CREATE_CUSTOMER
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+    DECLARE V_BDATE    DATE;
+    DECLARE V_AGE      INTEGER;
+    DECLARE V_NI       CHAR(9);
+    DECLARE V_SEGMENT  CHAR(3) DEFAULT 'MAS';
+    DECLARE V_BRANCH_CLOSED DATE;
+    DECLARE V_COUNT    INTEGER DEFAULT 0;
+
+    -- Race on the unique NI index: two onboarding sessions for the same person
+    DECLARE EXIT HANDLER FOR SQLSTATE '23505'
+        SIGNAL SQLSTATE '75007' SET MESSAGE_TEXT = 'Customer already registered';
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.LOG_ERROR('CUST.CREATE_CUSTOMER', V_SQLSTATE, V_SQLCODE, V_MSG,
+                            'NAME=' || COALESCE(P_LAST_NAME, '?') || ' DOB=' || COALESCE(CHAR(P_DATE_OF_BIRTH, ISO), '?'));
+        RESIGNAL;
+    END;
+
+    SET P_CUSTOMER_ID = NULL;
+    SET P_CUSTOMER_NO = NULL;
+
+    -- Names
+    IF P_FIRST_NAME IS NULL OR LENGTH(RTRIM(LTRIM(P_FIRST_NAME))) = 0
+       OR P_LAST_NAME IS NULL OR LENGTH(RTRIM(LTRIM(P_LAST_NAME))) = 0 THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'First and last name are required';
+    END IF;
+    IF TRANSLATE(UPPER(P_FIRST_NAME || P_LAST_NAME), '', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ -''') <> '' THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Name contains invalid characters';
+    END IF;
+
+    -- Age, as at the business date (date subtraction gives a yyyymmdd duration)
+    IF P_DATE_OF_BIRTH IS NULL THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Date of birth is required';
+    END IF;
+    SET V_BDATE = UTIL.CURRENT_BUSINESS_DATE();
+    IF P_DATE_OF_BIRTH >= V_BDATE THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Date of birth must be in the past';
+    END IF;
+    SET V_AGE = YEAR(V_BDATE - P_DATE_OF_BIRTH);
+    IF V_AGE < 16 THEN
+        SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = 'Customer must be aged 16 or over';
+    END IF;
+    IF V_AGE < 21 THEN
+        SET V_SEGMENT = 'STU';
+    END IF;
+
+    -- Home branch must exist and be open
+    SELECT CLOSED_DATE, 1 INTO V_BRANCH_CLOSED, V_COUNT
+      FROM REF.BRANCH
+     WHERE BRANCH_ID = P_BRANCH_ID
+      WITH UR;
+    IF V_COUNT = 0 OR V_BRANCH_CLOSED IS NOT NULL THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Invalid or closed home branch';
+    END IF;
+
+    -- NI number: optional, AA999999A, stored without spaces
+    IF P_NI_NUMBER IS NOT NULL AND LENGTH(RTRIM(P_NI_NUMBER)) > 0 THEN
+        SET V_NI = UPPER(REPLACE(P_NI_NUMBER, ' ', ''));
+        IF LENGTH(RTRIM(REPLACE(P_NI_NUMBER, ' ', ''))) <> 9
+           OR TRANSLATE(SUBSTR(V_NI, 1, 2) || SUBSTR(V_NI, 9, 1), '', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') <> ''
+           OR TRANSLATE(SUBSTR(V_NI, 3, 6), '', '0123456789') <> '' THEN
+            SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Invalid National Insurance number';
+        END IF;
+
+        SET V_COUNT = 0;
+        SELECT COUNT(*) INTO V_COUNT FROM CUST.CUSTOMER WHERE NI_NUMBER = V_NI;
+        IF V_COUNT > 0 THEN
+            SIGNAL SQLSTATE '75007' SET MESSAGE_TEXT = 'Customer already registered';
+        END IF;
+    END IF;
+
+    IF P_ADDRESS_LINE1 IS NOT NULL AND (P_TOWN IS NULL OR P_POSTCODE IS NULL) THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Address needs line 1, town and postcode';
+    END IF;
+
+    SET P_CUSTOMER_NO = 'C' || RTRIM(CHAR(NEXT VALUE FOR CUST.SEQ_CUSTOMER_NO));
+
+    INSERT INTO CUST.CUSTOMER
+        (CUSTOMER_NO, TITLE, FIRST_NAME, LAST_NAME, DATE_OF_BIRTH, NI_NUMBER,
+         SEGMENT, HOME_BRANCH_ID, STATUS, KYC_STATUS, OPENED_DATE)
+    VALUES
+        (P_CUSTOMER_NO, P_TITLE, RTRIM(LTRIM(P_FIRST_NAME)), RTRIM(LTRIM(P_LAST_NAME)),
+         P_DATE_OF_BIRTH, V_NI, V_SEGMENT, P_BRANCH_ID, 'A', 'P', UTIL.POSTING_DATE());
+
+    VALUES IDENTITY_VAL_LOCAL() INTO P_CUSTOMER_ID;
+
+    IF P_ADDRESS_LINE1 IS NOT NULL THEN
+        INSERT INTO CUST.ADDRESS (CUSTOMER_ID, ADDRESS_TYPE, LINE1, TOWN, POSTCODE, VALID_FROM)
+        VALUES (P_CUSTOMER_ID, 'H', P_ADDRESS_LINE1, P_TOWN, UPPER(P_POSTCODE), V_BDATE);
+    END IF;
+
+    IF P_EMAIL IS NOT NULL AND LENGTH(RTRIM(P_EMAIL)) > 0 THEN
+        INSERT INTO CUST.CONTACT (CUSTOMER_ID, CONTACT_TYPE, CONTACT_VALUE)
+        VALUES (P_CUSTOMER_ID, 'EMAIL', LOWER(RTRIM(P_EMAIL)));
+    END IF;
+
+    IF P_MOBILE IS NOT NULL AND LENGTH(RTRIM(P_MOBILE)) > 0 THEN
+        INSERT INTO CUST.CONTACT (CUSTOMER_ID, CONTACT_TYPE, CONTACT_VALUE)
+        VALUES (P_CUSTOMER_ID, 'MOBIL', REPLACE(P_MOBILE, ' ', ''));
+    END IF;
+
+    CALL UTIL.WRITE_AUDIT('CUST.CUSTOMER', RTRIM(CHAR(P_CUSTOMER_ID)), 'I',
+                          'Customer ' || P_CUSTOMER_NO || ' created, branch ' || RTRIM(CHAR(P_BRANCH_ID)));
+
+    CALL UTIL.ENQUEUE_NOTIFICATION(P_CUSTOMER_ID, 'WELCOME',
+                                   '{"customerNo":"' || P_CUSTOMER_NO || '","firstName":"' ||
+                                   RTRIM(LTRIM(P_FIRST_NAME)) || '"}');
+END@

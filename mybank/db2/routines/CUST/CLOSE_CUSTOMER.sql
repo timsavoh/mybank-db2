@@ -1,0 +1,128 @@
+-- Closes a customer relationship: closes every account they hold as primary (nested
+-- ACCT.CLOSE_ACCOUNT, sweeping balances to P_SWEEP_TO_ACCOUNT_ID if given), removes them
+-- from joint accounts, deactivates payees. All or nothing. Called by the app.
+-- Raises 75004 not found, 75009 already closed / active loan / sweep account is their own,
+-- plus anything ACCT.CLOSE_ACCOUNT raises (75003, 75009, 75014).
+CREATE OR REPLACE PROCEDURE CUST.CLOSE_CUSTOMER (
+    IN  P_CUSTOMER_ID         BIGINT,
+    IN  P_SWEEP_TO_ACCOUNT_ID BIGINT,
+    IN  P_REASON              VARCHAR(60),
+    OUT P_ACCOUNTS_CLOSED     INTEGER
+)
+    LANGUAGE SQL
+    SPECIFIC CUST_CLOSE_CUSTOMER
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE   CHAR(5);
+    DECLARE V_SQLCODE    INTEGER;
+    DECLARE V_MSG        VARCHAR(1000);
+    DECLARE V_STATUS     CHAR(1);
+    DECLARE V_COUNT      INTEGER DEFAULT 0;
+    DECLARE V_SWEPT      DECIMAL(15,2);
+    DECLARE V_ACCOUNT_ID BIGINT;
+    DECLARE V_REASON     VARCHAR(60);
+    DECLARE V_DONE       SMALLINT DEFAULT 0;
+
+    DECLARE C_ACCOUNTS CURSOR FOR
+        SELECT ACCOUNT_ID
+          FROM ACCT.ACCOUNT
+         WHERE PRIMARY_CUSTOMER_ID = P_CUSTOMER_ID
+           AND STATUS <> 'C'
+         ORDER BY ACCOUNT_ID
+           FOR READ ONLY;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET V_DONE = 1;
+
+    -- Undo everything done so far (including accounts already closed), log, re-raise
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        ROLLBACK TO SAVEPOINT SP_CLOSE_CUSTOMER;
+        CALL UTIL.LOG_ERROR('CUST.CLOSE_CUSTOMER', V_SQLSTATE, V_SQLCODE, V_MSG,
+                            'CUSTOMER_ID=' || COALESCE(RTRIM(CHAR(P_CUSTOMER_ID)), 'NULL') ||
+                            ' AT ACCOUNT_ID=' || COALESCE(RTRIM(CHAR(V_ACCOUNT_ID)), '-'));
+        RESIGNAL;
+    END;
+
+    SET P_ACCOUNTS_CLOSED = 0;
+    SAVEPOINT SP_CLOSE_CUSTOMER ON ROLLBACK RETAIN CURSORS;
+
+    SELECT STATUS INTO V_STATUS
+      FROM CUST.CUSTOMER
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+      WITH RS USE AND KEEP UPDATE LOCKS;
+
+    IF V_STATUS IS NULL THEN
+        SIGNAL SQLSTATE '75004' SET MESSAGE_TEXT = 'Customer not found';
+    END IF;
+    IF V_STATUS = 'C' THEN
+        SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = 'Customer is already closed';
+    END IF;
+
+    SELECT COUNT(*) INTO V_COUNT
+      FROM LOAN.LOAN
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+       AND STATUS = 'A';
+    IF V_COUNT > 0 THEN
+        SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = 'Customer has an active loan';
+    END IF;
+
+    IF P_SWEEP_TO_ACCOUNT_ID IS NOT NULL THEN
+        SELECT COUNT(*) INTO V_COUNT
+          FROM ACCT.ACCOUNT_HOLDER
+         WHERE ACCOUNT_ID = P_SWEEP_TO_ACCOUNT_ID
+           AND CUSTOMER_ID = P_CUSTOMER_ID;
+        IF V_COUNT > 0 THEN
+            SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = 'Sweep account must not be one being closed';
+        END IF;
+    END IF;
+
+    SET V_REASON = COALESCE(P_REASON, 'Customer relationship closed');
+
+    SET V_DONE = 0;
+    OPEN C_ACCOUNTS;
+    ACCOUNT_LOOP: LOOP
+        FETCH C_ACCOUNTS INTO V_ACCOUNT_ID;
+        IF V_DONE = 1 THEN
+            LEAVE ACCOUNT_LOOP;
+        END IF;
+
+        CALL ACCT.CLOSE_ACCOUNT(V_ACCOUNT_ID, P_SWEEP_TO_ACCOUNT_ID, V_REASON, V_SWEPT);
+        SET P_ACCOUNTS_CLOSED = P_ACCOUNTS_CLOSED + 1;
+    END LOOP ACCOUNT_LOOP;
+    CLOSE C_ACCOUNTS;
+    SET V_ACCOUNT_ID = NULL;
+
+    -- Joint accounts held with someone else stay open without this customer
+    DELETE FROM ACCT.ACCOUNT_HOLDER H
+     WHERE H.CUSTOMER_ID = P_CUSTOMER_ID
+       AND H.HOLDER_ROLE = 'J'
+       AND EXISTS (SELECT 1 FROM ACCT.ACCOUNT A
+                    WHERE A.ACCOUNT_ID = H.ACCOUNT_ID
+                      AND A.STATUS <> 'C');
+
+    UPDATE CARD.CARD
+       SET STATUS = 'B',
+           BLOCKED_REASON = 'CUSTOMER CLOSED'
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+       AND STATUS = 'A';
+
+    UPDATE PAY.PAYEE
+       SET ACTIVE = 'N'
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+       AND ACTIVE = 'Y';
+
+    UPDATE CUST.CUSTOMER
+       SET STATUS = 'C',
+           CLOSED_DATE = UTIL.POSTING_DATE()
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID;
+
+    RELEASE SAVEPOINT SP_CLOSE_CUSTOMER;
+
+    CALL UTIL.WRITE_AUDIT('CUST.CUSTOMER', RTRIM(CHAR(P_CUSTOMER_ID)), 'U',
+                          'Customer closed: ' || V_REASON || '. Accounts closed: ' ||
+                          RTRIM(CHAR(P_ACCOUNTS_CLOSED)));
+END@

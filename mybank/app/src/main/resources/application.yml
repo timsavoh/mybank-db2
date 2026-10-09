@@ -1,0 +1,57 @@
+spring:
+  application:
+    name: mybank
+  datasource:
+    url: jdbc:db2://${DB_HOST:localhost}:${DB_PORT:50000}/MYBANK:retrieveMessagesFromServerOnGetMessage=true;
+    username: ${DB_USER:db2inst1}
+    password: ${DB_PASSWORD:mybank-dev-pw}
+    driver-class-name: com.ibm.db2.jcc.DB2Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      connection-timeout: 10000
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  port: ${PORT:8080}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+
+mybank:
+  loadgen:
+    base-url: ${LOADGEN_TARGET:http://localhost:8080}
+    initial-tps: ${LOADGEN_TPS:10}
+    max-tps: ${LOADGEN_MAX_TPS:200}
+  scheduler:
+    tick-seconds: ${SCHEDULER_TICK_SECONDS:15}
+    intraday-seconds: ${SCHEDULER_INTRADAY_SECONDS:60}
+  loadgen-url: ${LOADGEN_URL:http://localhost:8081}
+
+---
+spring:
+  config:
+    activate:
+      on-profile: scheduler
+  main:
+    web-application-type: none
+  datasource:
+    hikari:
+      maximum-pool-size: 3
+
+---
+spring:
+  config:
+    activate:
+      on-profile: loadgen
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceTransactionManagerAutoConfiguration
+      - org.springframework.boot.autoconfigure.jdbc.JdbcTemplateAutoConfiguration
+server:
+  port: ${PORT:8081}

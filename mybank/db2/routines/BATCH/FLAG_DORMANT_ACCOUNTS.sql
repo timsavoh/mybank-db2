@@ -1,0 +1,73 @@
+-- EOD: marks active accounts dormant ('D') after 12 months without customer activity (anything
+-- but interest and fees) and tells the customer. Any customer posting wakes the account again
+-- (ACCT.TRG_ACCOUNT_ACTIVITY). Loan accounts are never made dormant.
+CREATE OR REPLACE PROCEDURE BATCH.FLAG_DORMANT_ACCOUNTS (OUT P_ROWS_PROCESSED INTEGER)
+    LANGUAGE SQL
+    SPECIFIC BATCH_FLAG_DORMANT_ACCOUNTS
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+    DECLARE V_RUN_ID   BIGINT;
+    DECLARE V_ROWS     INTEGER DEFAULT 0;
+    DECLARE V_COUNT    INTEGER;
+    DECLARE V_TODAY    DATE;
+    DECLARE V_THRESHOLD DATE;
+    DECLARE V_DORMANCY_MONTHS INTEGER DEFAULT 12;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.END_JOB_RUN(V_RUN_ID, 'F', V_ROWS, V_MSG);
+        CALL UTIL.LOG_ERROR('BATCH.FLAG_DORMANT_ACCOUNTS', V_SQLSTATE, V_SQLCODE, V_MSG, NULL);
+        RESIGNAL;
+    END;
+
+    CALL UTIL.START_JOB_RUN('FLAG_DORMANT_ACCOUNTS', V_RUN_ID);
+    SET V_TODAY = UTIL.CURRENT_BUSINESS_DATE();
+    SET V_THRESHOLD = ADD_MONTHS(V_TODAY, -V_DORMANCY_MONTHS);
+
+    FOR D AS C_DORMANT CURSOR WITH HOLD FOR
+        SELECT A.ACCOUNT_ID, A.PRIMARY_CUSTOMER_ID, A.SORT_CODE, A.ACCOUNT_NO,
+               COALESCE(A.LAST_ACTIVITY_DATE, A.OPENED_DATE) AS LAST_SEEN
+          FROM ACCT.ACCOUNT A
+          JOIN REF.PRODUCT P
+            ON P.PRODUCT_CODE = A.PRODUCT_CODE
+         WHERE A.STATUS = 'A'
+           AND P.PRODUCT_TYPE <> 'LON'
+           AND COALESCE(A.LAST_ACTIVITY_DATE, A.OPENED_DATE) < V_THRESHOLD
+           -- LAST_ACTIVITY_DATE is only maintained for non-SYS channels, so check the ledger too
+           AND NOT EXISTS (SELECT 1
+                             FROM TXN.POSTED_TXN T
+                            WHERE T.ACCOUNT_ID = A.ACCOUNT_ID
+                              AND T.BUSINESS_DATE >= V_THRESHOLD
+                              AND T.TXN_TYPE NOT IN ('INT', 'FEE'))
+         ORDER BY A.ACCOUNT_ID
+    DO
+        UPDATE ACCT.ACCOUNT
+           SET STATUS = 'D'
+         WHERE ACCOUNT_ID = D.ACCOUNT_ID
+           AND STATUS = 'A';
+        GET DIAGNOSTICS V_COUNT = ROW_COUNT;
+
+        IF V_COUNT = 1 THEN
+            CALL UTIL.ENQUEUE_NOTIFICATION(D.PRIMARY_CUSTOMER_ID, 'ACCOUNT_DORMANT',
+                 '{"sortCode":"' || UTIL.FORMAT_SORT_CODE(D.SORT_CODE) || '","accountNo":"' || D.ACCOUNT_NO
+                 || '","lastActivity":"' || CHAR(D.LAST_SEEN, ISO) || '"}');
+            SET V_ROWS = V_ROWS + 1;
+            IF MOD(V_ROWS, 500) = 0 THEN
+                COMMIT;
+            END IF;
+        END IF;
+    END FOR;
+
+    COMMIT;
+
+    SET P_ROWS_PROCESSED = V_ROWS;
+    CALL UTIL.END_JOB_RUN(V_RUN_ID, 'S', V_ROWS,
+         RTRIM(CHAR(V_ROWS)) || ' accounts made dormant (no activity since ' || CHAR(V_THRESHOLD, ISO) || ')');
+END@

@@ -1,0 +1,16 @@
+-- Records the start of a batch job run. AUTONOMOUS so the run record survives
+-- a rollback of the job's own work.
+CREATE OR REPLACE PROCEDURE UTIL.START_JOB_RUN (
+    IN  P_JOB_NAME VARCHAR(40),
+    OUT P_RUN_ID   BIGINT
+)
+    LANGUAGE SQL
+    SPECIFIC UTIL_START_JOB_RUN
+    AUTONOMOUS
+    MODIFIES SQL DATA
+BEGIN
+    SELECT RUN_ID
+      INTO P_RUN_ID
+      FROM FINAL TABLE (INSERT INTO OPS.BATCH_JOB_RUN (JOB_NAME, BUSINESS_DATE, STATUS)
+                        VALUES (P_JOB_NAME, UTIL.CURRENT_BUSINESS_DATE(), 'R'));
+END@

@@ -1,0 +1,78 @@
+-- Adds a saved payee for a customer. Called by the app (web, mobile). Accepts 080101 or 08-01-01.
+-- Returns the existing payee id if the customer already has this sort code / account number.
+-- Raises 75004 customer not found or not active, 75008 missing argument, 75011 modulus check failed.
+CREATE OR REPLACE PROCEDURE PAY.CREATE_PAYEE (
+    IN  P_CUSTOMER_ID BIGINT,
+    IN  P_NAME        VARCHAR(60),
+    IN  P_SORT_CODE   VARCHAR(8),
+    IN  P_ACCOUNT_NO  CHAR(8),
+    IN  P_REFERENCE   VARCHAR(18),
+    OUT P_PAYEE_ID    BIGINT
+)
+    LANGUAGE SQL
+    SPECIFIC PAY_CREATE_PAYEE
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+
+    DECLARE V_CUST_STATUS CHAR(1);
+    DECLARE V_SORT_CODE   CHAR(6);
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.LOG_ERROR('PAY.CREATE_PAYEE', V_SQLSTATE, V_SQLCODE, V_MSG,
+             'CUSTOMER=' || COALESCE(RTRIM(CHAR(P_CUSTOMER_ID)), 'NULL') ||
+             ' SORT=' || COALESCE(P_SORT_CODE, 'NULL') || ' ACCT=' || COALESCE(P_ACCOUNT_NO, 'NULL'));
+        RESIGNAL;
+    END;
+
+    SET P_PAYEE_ID = NULL;
+
+    IF P_NAME IS NULL OR LENGTH(RTRIM(P_NAME)) = 0 OR P_SORT_CODE IS NULL OR P_ACCOUNT_NO IS NULL THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Payee name, sort code and account number required';
+    END IF;
+
+    SELECT STATUS INTO V_CUST_STATUS
+      FROM CUST.CUSTOMER
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+      WITH UR;
+
+    IF V_CUST_STATUS IS NULL OR V_CUST_STATUS <> 'A' THEN
+        SIGNAL SQLSTATE '75004' SET MESSAGE_TEXT = 'Customer not found or not active';
+    END IF;
+
+    -- Screens send 08-01-01; the scheme wants 080101
+    SET V_SORT_CODE = LPAD(REPLACE(REPLACE(RTRIM(LTRIM(P_SORT_CODE)), '-', ''), ' ', ''), 6, '0');
+
+    IF UTIL.MODULUS_CHECK(V_SORT_CODE, P_ACCOUNT_NO) = 0 THEN
+        SIGNAL SQLSTATE '75011' SET MESSAGE_TEXT = 'Sort code / account number failed validation';
+    END IF;
+
+    SELECT PAYEE_ID INTO P_PAYEE_ID
+      FROM PAY.PAYEE
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID
+       AND SORT_CODE = V_SORT_CODE
+       AND ACCOUNT_NO = P_ACCOUNT_NO
+       AND ACTIVE = 'Y'
+     FETCH FIRST 1 ROW ONLY;
+
+    IF P_PAYEE_ID IS NOT NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT PAYEE_ID INTO P_PAYEE_ID
+      FROM FINAL TABLE (INSERT INTO PAY.PAYEE
+                            (CUSTOMER_ID, NAME, SORT_CODE, ACCOUNT_NO, REFERENCE, CREATED_DATE)
+                        VALUES (P_CUSTOMER_ID, UPPER(RTRIM(P_NAME)), V_SORT_CODE, P_ACCOUNT_NO,
+                                P_REFERENCE, UTIL.CURRENT_BUSINESS_DATE()));
+
+    CALL UTIL.ENQUEUE_NOTIFICATION(P_CUSTOMER_ID, 'PAYEE_ADDED',
+         '{"payee":"' || UPPER(RTRIM(P_NAME)) || '","sortCode":"' || UTIL.FORMAT_SORT_CODE(V_SORT_CODE) ||
+         '","account":"****' || SUBSTR(P_ACCOUNT_NO, 5, 4) || '"}');
+END@

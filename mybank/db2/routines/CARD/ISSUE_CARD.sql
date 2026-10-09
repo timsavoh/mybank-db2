@@ -1,0 +1,125 @@
+-- Issues a debit card on a current account. Called by the app (teller, web).
+-- PAN = BIN 492912 + 9 digits from CARD.SEQ_CARD_NO + Luhn digit; expires end of month +3 years.
+-- An existing active card for the same customer and account is blocked and the REPLCARD fee charged.
+-- Raises 75002/75003 account, 75004 customer, 75008 bad card type, 75009 not a holder / not a current account.
+CREATE OR REPLACE PROCEDURE CARD.ISSUE_CARD (
+    IN  P_ACCOUNT_ID  BIGINT,
+    IN  P_CUSTOMER_ID BIGINT,
+    IN  P_CARD_TYPE   CHAR(1),
+    OUT P_CARD_ID     BIGINT,
+    OUT P_MASKED_PAN  CHAR(16)
+)
+    LANGUAGE SQL
+    SPECIFIC CARD_ISSUE_CARD
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+
+    DECLARE V_CARD_TYPE    CHAR(1);
+    DECLARE V_CUST_STATUS  CHAR(1);
+    DECLARE V_SEGMENT      CHAR(3);
+    DECLARE V_PRODUCT_TYPE CHAR(3);
+    DECLARE V_IS_HOLDER    INTEGER DEFAULT 0;
+    DECLARE V_OLD_CARD_ID  BIGINT;
+    DECLARE V_FEE          DECIMAL(9,2);
+    DECLARE V_FEE_GL       CHAR(4);
+    DECLARE V_SEQ          BIGINT;
+    DECLARE V_BODY         CHAR(15);
+    DECLARE V_PAN          CHAR(16);
+    DECLARE V_DATE         DATE;
+    DECLARE V_TXN_ID       BIGINT;
+    DECLARE V_BALANCE      DECIMAL(15,2);
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.LOG_ERROR('CARD.ISSUE_CARD', V_SQLSTATE, V_SQLCODE, V_MSG,
+             'ACCOUNT=' || COALESCE(RTRIM(CHAR(P_ACCOUNT_ID)), 'NULL') ||
+             ' CUSTOMER=' || COALESCE(RTRIM(CHAR(P_CUSTOMER_ID)), 'NULL'));
+        RESIGNAL;
+    END;
+
+    SET V_CARD_TYPE = COALESCE(P_CARD_TYPE, 'D');
+    IF V_CARD_TYPE NOT IN ('D', 'C') THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Card type must be D or C';
+    END IF;
+
+    SELECT STATUS, SEGMENT INTO V_CUST_STATUS, V_SEGMENT
+      FROM CUST.CUSTOMER
+     WHERE CUSTOMER_ID = P_CUSTOMER_ID;
+
+    IF V_CUST_STATUS IS NULL OR V_CUST_STATUS <> 'A' THEN
+        SIGNAL SQLSTATE '75004' SET MESSAGE_TEXT = 'Customer not found or not active';
+    END IF;
+
+    CALL UTIL.CHECK_ACCOUNT_STATUS(P_ACCOUNT_ID, 'Y');
+
+    SELECT P.PRODUCT_TYPE,
+           CASE WHEN A.PRIMARY_CUSTOMER_ID = P_CUSTOMER_ID
+                  OR EXISTS (SELECT 1 FROM ACCT.ACCOUNT_HOLDER H
+                              WHERE H.ACCOUNT_ID = A.ACCOUNT_ID
+                                AND H.CUSTOMER_ID = P_CUSTOMER_ID)
+                THEN 1 ELSE 0 END
+      INTO V_PRODUCT_TYPE, V_IS_HOLDER
+      FROM ACCT.ACCOUNT A
+      JOIN REF.PRODUCT P ON P.PRODUCT_CODE = A.PRODUCT_CODE
+     WHERE A.ACCOUNT_ID = P_ACCOUNT_ID;
+
+    IF V_IS_HOLDER = 0 THEN
+        SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = 'Customer is not a holder of this account';
+    END IF;
+    IF V_PRODUCT_TYPE <> 'CUR' THEN
+        SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = 'Cards can only be issued on current accounts';
+    END IF;
+
+    SET V_DATE = UTIL.CURRENT_BUSINESS_DATE();
+
+    -- Replacement: block the card being replaced and charge for it
+    SELECT CARD_ID INTO V_OLD_CARD_ID
+      FROM CARD.CARD
+     WHERE ACCOUNT_ID = P_ACCOUNT_ID
+       AND CUSTOMER_ID = P_CUSTOMER_ID
+       AND STATUS = 'A'
+     ORDER BY ISSUED_DATE DESC, CARD_ID DESC
+     FETCH FIRST 1 ROW ONLY
+      WITH RS USE AND KEEP UPDATE LOCKS;
+
+    IF V_OLD_CARD_ID IS NOT NULL THEN
+        UPDATE CARD.CARD
+           SET STATUS = 'B',
+               BLOCKED_REASON = 'REPLACED'
+         WHERE CARD_ID = V_OLD_CARD_ID;
+
+        SET V_FEE = UTIL.CALC_FEE('REPLCARD', 0);
+        IF V_FEE > 0 THEN
+            SELECT GL_CODE INTO V_FEE_GL FROM REF.FEE_SCHEDULE WHERE FEE_CODE = 'REPLCARD' WITH UR;
+            CALL UTIL.POST_LEDGER_ENTRY(P_ACCOUNT_ID, -V_FEE, 'FEE', 'Replacement card fee',
+                 'REPLCARD', V_FEE_GL, NULL, NULL, 'Y', NULL, NULL, NULL, NULL, NULL,
+                 V_TXN_ID, V_BALANCE);
+        END IF;
+    END IF;
+
+    SET V_SEQ = NEXT VALUE FOR CARD.SEQ_CARD_NO;
+    SET V_BODY = '492912' || RIGHT(DIGITS(V_SEQ), 9);
+    SET V_PAN = V_BODY || CARD.LUHN_DIGIT(V_BODY);
+
+    SELECT CARD_ID INTO P_CARD_ID
+      FROM FINAL TABLE (INSERT INTO CARD.CARD
+                            (PAN, ACCOUNT_ID, CUSTOMER_ID, CARD_TYPE, STATUS, EXPIRY_DATE,
+                             DAILY_LIMIT, CONTACTLESS, ISSUED_DATE)
+                        VALUES (V_PAN, P_ACCOUNT_ID, P_CUSTOMER_ID, V_CARD_TYPE, 'A',
+                                LAST_DAY(ADD_MONTHS(V_DATE, 36)),
+                                CASE V_SEGMENT WHEN 'STU' THEN 500 WHEN 'PRM' THEN 3000 ELSE 1500 END,
+                                'Y', V_DATE));
+
+    SET P_MASKED_PAN = UTIL.MASK_PAN(V_PAN);
+
+    CALL UTIL.ENQUEUE_NOTIFICATION(P_CUSTOMER_ID, 'CARD_ISSUED',
+         '{"card":"' || P_MASKED_PAN || '","replacement":' ||
+         CASE WHEN V_OLD_CARD_ID IS NULL THEN 'false' ELSE 'true' END || '}');
+END@

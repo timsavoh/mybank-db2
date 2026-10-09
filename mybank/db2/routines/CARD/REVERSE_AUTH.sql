@@ -1,0 +1,74 @@
+-- Reverses an open card authorisation (merchant cancel / network reversal) and releases its hold.
+-- Identify the auth by P_AUTH_ID or, if that is NULL, by the network's P_EXTERNAL_REF.
+-- Reversing an already reversed auth is a no-op. Raises 75009 not found or not reversible.
+CREATE OR REPLACE PROCEDURE CARD.REVERSE_AUTH (
+    IN  P_AUTH_ID      BIGINT,
+    IN  P_EXTERNAL_REF VARCHAR(40),
+    OUT P_STATUS       CHAR(1)
+)
+    LANGUAGE SQL
+    SPECIFIC CARD_REVERSE_AUTH
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+
+    DECLARE V_AUTH_ID BIGINT;
+    DECLARE V_HOLD_ID BIGINT;
+    DECLARE V_ROWS    INTEGER DEFAULT 0;
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.LOG_ERROR('CARD.REVERSE_AUTH', V_SQLSTATE, V_SQLCODE, V_MSG,
+             'AUTH_ID=' || COALESCE(RTRIM(CHAR(P_AUTH_ID)), 'NULL') ||
+             ' REF=' || COALESCE(P_EXTERNAL_REF, 'NULL'));
+        RESIGNAL;
+    END;
+
+    SET P_STATUS = NULL;
+
+    IF P_AUTH_ID IS NOT NULL THEN
+        SELECT AUTH_ID, STATUS, HOLD_ID INTO V_AUTH_ID, P_STATUS, V_HOLD_ID
+          FROM CARD.AUTHORISATION
+         WHERE AUTH_ID = P_AUTH_ID
+          WITH RS USE AND KEEP UPDATE LOCKS;
+    ELSE
+        SELECT AUTH_ID, STATUS, HOLD_ID INTO V_AUTH_ID, P_STATUS, V_HOLD_ID
+          FROM CARD.AUTHORISATION
+         WHERE EXTERNAL_REF = P_EXTERNAL_REF
+          WITH RS USE AND KEEP UPDATE LOCKS;
+    END IF;
+
+    IF V_AUTH_ID IS NULL THEN
+        SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = 'Authorisation not found';
+    END IF;
+
+    IF P_STATUS = 'R' THEN
+        RETURN;
+    END IF;
+
+    IF P_STATUS <> 'A' THEN
+        SET V_MSG = 'Authorisation in status ' || P_STATUS || ' cannot be reversed';
+        SIGNAL SQLSTATE '75009' SET MESSAGE_TEXT = V_MSG;
+    END IF;
+
+    UPDATE CARD.AUTHORISATION
+       SET STATUS = 'R'
+     WHERE AUTH_ID = V_AUTH_ID;
+
+    -- The hold may already have lapsed (BATCH.EXPIRE_CARD_AUTHS); that is fine
+    UPDATE ACCT.ACCOUNT_HOLD
+       SET STATUS = 'R',
+           RELEASED_TS = CURRENT TIMESTAMP
+     WHERE HOLD_ID = V_HOLD_ID
+       AND STATUS = 'A';
+
+    GET DIAGNOSTICS V_ROWS = ROW_COUNT;
+
+    SET P_STATUS = 'R';
+END@

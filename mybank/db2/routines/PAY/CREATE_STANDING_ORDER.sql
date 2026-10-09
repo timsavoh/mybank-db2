@@ -1,0 +1,94 @@
+-- Sets up a standing order to a saved payee. Called by the app (web, mobile, teller).
+-- First payment date defaults to the next business day and is rolled forward off weekends/holidays.
+-- Raises 75002/75003 account, 75008 bad amount/frequency/dates, 75012 payee not found.
+CREATE OR REPLACE PROCEDURE PAY.CREATE_STANDING_ORDER (
+    IN  P_ACCOUNT_ID BIGINT,
+    IN  P_PAYEE_ID   BIGINT,
+    IN  P_AMOUNT     DECIMAL(15,2),
+    IN  P_FREQUENCY  CHAR(1),
+    IN  P_FIRST_DATE DATE,
+    IN  P_END_DATE   DATE,
+    OUT P_SO_ID      BIGINT
+)
+    LANGUAGE SQL
+    SPECIFIC PAY_CREATE_STANDING_ORDER
+    MODIFIES SQL DATA
+BEGIN
+    DECLARE SQLSTATE CHAR(5) DEFAULT '00000';
+    DECLARE SQLCODE  INTEGER DEFAULT 0;
+    DECLARE V_SQLSTATE CHAR(5);
+    DECLARE V_SQLCODE  INTEGER;
+    DECLARE V_MSG      VARCHAR(1000);
+
+    DECLARE V_TODAY       DATE;
+    DECLARE V_FIRST_DUE   DATE;
+    DECLARE V_CUSTOMER_ID BIGINT;
+    DECLARE V_PAYEE_NAME  VARCHAR(60);
+
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS EXCEPTION 1 V_MSG = MESSAGE_TEXT;
+        VALUES (SQLSTATE, SQLCODE) INTO V_SQLSTATE, V_SQLCODE;
+        CALL UTIL.LOG_ERROR('PAY.CREATE_STANDING_ORDER', V_SQLSTATE, V_SQLCODE, V_MSG,
+             'ACCOUNT=' || COALESCE(RTRIM(CHAR(P_ACCOUNT_ID)), 'NULL') ||
+             ' PAYEE=' || COALESCE(RTRIM(CHAR(P_PAYEE_ID)), 'NULL') ||
+             ' AMOUNT=' || COALESCE(VARCHAR(P_AMOUNT), 'NULL'));
+        RESIGNAL;
+    END;
+
+    SET P_SO_ID = NULL;
+
+    IF P_AMOUNT IS NULL OR P_AMOUNT <= 0 THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Standing order amount must be greater than zero';
+    END IF;
+    IF P_FREQUENCY IS NULL OR P_FREQUENCY NOT IN ('W', 'M', 'Q', 'A') THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Frequency must be W, M, Q or A';
+    END IF;
+
+    CALL UTIL.CHECK_ACCOUNT_STATUS(P_ACCOUNT_ID, 'Y');
+
+    SELECT PRIMARY_CUSTOMER_ID INTO V_CUSTOMER_ID
+      FROM ACCT.ACCOUNT
+     WHERE ACCOUNT_ID = P_ACCOUNT_ID;
+
+    SELECT Y.NAME INTO V_PAYEE_NAME
+      FROM PAY.PAYEE Y
+     WHERE Y.PAYEE_ID = P_PAYEE_ID
+       AND Y.ACTIVE = 'Y'
+       AND (Y.CUSTOMER_ID = V_CUSTOMER_ID
+            OR EXISTS (SELECT 1 FROM ACCT.ACCOUNT_HOLDER H
+                        WHERE H.ACCOUNT_ID = P_ACCOUNT_ID
+                          AND H.CUSTOMER_ID = Y.CUSTOMER_ID))
+      WITH UR;
+
+    IF V_PAYEE_NAME IS NULL THEN
+        SIGNAL SQLSTATE '75012' SET MESSAGE_TEXT = 'Payee not found';
+    END IF;
+
+    SET V_TODAY = UTIL.POSTING_DATE();
+
+    -- Earliest first payment is the next business day; due dates falling on a weekend or
+    -- bank holiday move to the following business day (NEXT_BUSINESS_DAY is "strictly after")
+    IF P_FIRST_DATE IS NULL THEN
+        SET V_FIRST_DUE = UTIL.NEXT_BUSINESS_DAY(V_TODAY);
+    ELSEIF P_FIRST_DATE <= V_TODAY THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'First payment date must be in the future';
+    ELSE
+        SET V_FIRST_DUE = UTIL.NEXT_BUSINESS_DAY(P_FIRST_DATE - 1 DAY);
+    END IF;
+
+    IF P_END_DATE IS NOT NULL AND P_END_DATE < V_FIRST_DUE THEN
+        SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'End date is before the first payment date';
+    END IF;
+
+    SELECT SO_ID INTO P_SO_ID
+      FROM FINAL TABLE (INSERT INTO PAY.STANDING_ORDER
+                            (ACCOUNT_ID, PAYEE_ID, AMOUNT, FREQUENCY, NEXT_DUE_DATE, END_DATE,
+                             STATUS, CREATED_DATE)
+                        VALUES (P_ACCOUNT_ID, P_PAYEE_ID, P_AMOUNT, P_FREQUENCY, V_FIRST_DUE,
+                                P_END_DATE, 'A', UTIL.CURRENT_BUSINESS_DATE()));
+
+    CALL UTIL.WRITE_AUDIT('PAY.STANDING_ORDER', RTRIM(CHAR(P_SO_ID)), 'I',
+         'NEW SO ' || P_FREQUENCY || ' ' || VARCHAR(P_AMOUNT) || ' TO ' || V_PAYEE_NAME ||
+         ' FIRST ' || VARCHAR_FORMAT(V_FIRST_DUE, 'DD/MM/YYYY'));
+END@

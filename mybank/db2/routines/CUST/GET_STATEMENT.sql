@@ -1,0 +1,97 @@
+-- Statement header and lines for display/print, formatted the way the old print run did.
+-- P_STATEMENT_ID NULL = latest statement for the account. Returns 2 result sets (both
+-- empty if no statement has been generated yet). Raises 75002 account not found,
+-- 75008 statement not found for this account.
+CREATE OR REPLACE PROCEDURE CUST.GET_STATEMENT (
+    IN  P_ACCOUNT_ID   BIGINT,
+    IN  P_STATEMENT_ID BIGINT,
+    OUT P_FOUND_ID     BIGINT
+)
+    LANGUAGE SQL
+    SPECIFIC CUST_GET_STATEMENT
+    DYNAMIC RESULT SETS 2
+    READS SQL DATA
+BEGIN
+    DECLARE V_COUNT INTEGER DEFAULT 0;
+
+    DECLARE C_HEADER CURSOR WITH RETURN TO CLIENT FOR
+        SELECT S.STATEMENT_ID,
+               A.ACCOUNT_NAME,
+               UTIL.FORMAT_SORT_CODE(A.SORT_CODE) AS SORT_CODE,
+               A.ACCOUNT_NO,
+               P.NAME AS PRODUCT_NAME,
+               B.NAME AS BRANCH_NAME,
+               RTRIM(COALESCE(C.TITLE || ' ', '') || C.FIRST_NAME || ' ' || C.LAST_NAME) AS CUSTOMER_NAME,
+               AD.LINE1, AD.LINE2, AD.TOWN, AD.POSTCODE,
+               S.PERIOD_START,
+               S.PERIOD_END,
+               VARCHAR_FORMAT(S.PERIOD_START, 'DD Month YYYY') || ' to ' ||
+                   VARCHAR_FORMAT(S.PERIOD_END, 'DD Month YYYY') AS PERIOD_TEXT,
+               S.OPENING_BALANCE,
+               S.TOTAL_IN,
+               S.TOTAL_OUT,
+               S.CLOSING_BALANCE,
+               VARCHAR_FORMAT(S.OPENING_BALANCE, 'S999,999,990.00') AS OPENING_TEXT,
+               VARCHAR_FORMAT(S.CLOSING_BALANCE, 'S999,999,990.00') AS CLOSING_TEXT,
+               S.LINE_COUNT,
+               VARCHAR_FORMAT(S.GENERATED_TS, 'DD/MM/YYYY HH24:MI') AS GENERATED_TEXT
+          FROM OPS.STATEMENT S
+          JOIN ACCT.ACCOUNT A ON A.ACCOUNT_ID = S.ACCOUNT_ID
+          JOIN REF.PRODUCT P ON P.PRODUCT_CODE = A.PRODUCT_CODE
+          JOIN REF.BRANCH B ON B.BRANCH_ID = A.BRANCH_ID
+          JOIN CUST.CUSTOMER C ON C.CUSTOMER_ID = A.PRIMARY_CUSTOMER_ID
+          LEFT JOIN CUST.ADDRESS AD
+                 ON AD.CUSTOMER_ID = C.CUSTOMER_ID
+                AND AD.ADDRESS_TYPE = 'H'
+                AND AD.VALID_TO IS NULL
+         WHERE S.STATEMENT_ID = P_FOUND_ID
+          WITH UR;
+
+    DECLARE C_LINES CURSOR WITH RETURN TO CLIENT FOR
+        SELECT L.LINE_NO,
+               L.TXN_ID,
+               L.BUSINESS_DATE,
+               VARCHAR_FORMAT(L.BUSINESS_DATE, 'DD Mon YY') AS DATE_TEXT,
+               L.DESCRIPTION,
+               CASE WHEN L.AMOUNT < 0 THEN -L.AMOUNT END AS PAID_OUT,
+               CASE WHEN L.AMOUNT > 0 THEN L.AMOUNT END  AS PAID_IN,
+               L.BALANCE_AFTER,
+               VARCHAR_FORMAT(ABS(L.AMOUNT), '999,999,990.00') AS AMOUNT_TEXT,
+               VARCHAR_FORMAT(ABS(L.BALANCE_AFTER), '999,999,990.00') ||
+                   CASE WHEN L.BALANCE_AFTER < 0 THEN ' OD' ELSE '' END AS BALANCE_TEXT
+          FROM OPS.STATEMENT_LINE L
+         WHERE L.STATEMENT_ID = P_FOUND_ID
+         ORDER BY L.LINE_NO
+          WITH UR;
+
+    SET P_FOUND_ID = NULL;
+
+    SELECT COUNT(*) INTO V_COUNT
+      FROM ACCT.ACCOUNT
+     WHERE ACCOUNT_ID = P_ACCOUNT_ID
+      WITH UR;
+    IF V_COUNT = 0 THEN
+        SIGNAL SQLSTATE '75002' SET MESSAGE_TEXT = 'Account not found';
+    END IF;
+
+    IF P_STATEMENT_ID IS NOT NULL THEN
+        SELECT STATEMENT_ID INTO P_FOUND_ID
+          FROM OPS.STATEMENT
+         WHERE STATEMENT_ID = P_STATEMENT_ID
+           AND ACCOUNT_ID = P_ACCOUNT_ID
+          WITH UR;
+        IF P_FOUND_ID IS NULL THEN
+            SIGNAL SQLSTATE '75008' SET MESSAGE_TEXT = 'Statement not found for this account';
+        END IF;
+    ELSE
+        SELECT STATEMENT_ID INTO P_FOUND_ID
+          FROM OPS.STATEMENT
+         WHERE ACCOUNT_ID = P_ACCOUNT_ID
+         ORDER BY PERIOD_END DESC
+         FETCH FIRST 1 ROW ONLY
+          WITH UR;
+    END IF;
+
+    OPEN C_HEADER;
+    OPEN C_LINES;
+END@

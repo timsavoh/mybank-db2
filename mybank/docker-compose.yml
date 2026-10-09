@@ -1,0 +1,78 @@
+name: mybank
+
+services:
+  db2:
+    image: icr.io/db2_community/db2:12.1.5.0@sha256:2de8151713c261843868c5c3411b57be6ae79d99d70a5b3022337836776bfda6
+    platform: linux/amd64
+    privileged: true
+    hostname: db2
+    stop_grace_period: 60s
+    ports:
+      - "50000:50000"
+    environment:
+      LICENSE: accept
+      DB2INSTANCE: db2inst1
+      DB2INST1_PASSWORD: ${DB2INST1_PASSWORD}
+      DBNAME: MYBANK
+      BLU: "false"
+      ENABLE_ORACLE_COMPATIBILITY: "false"
+      UPDATEAVAIL: "NO"
+      TO_CREATE_SAMPLEDB: "false"
+      REPODB: "false"
+      IS_OSXFS: "false"
+      PERSISTENT_HOME: "true"
+      HADR_ENABLED: "false"
+      ARCHIVE_LOGS: "false"
+      AUTOCONFIG: "false"
+    volumes:
+      - db2data:/database
+      - ./db2:/mybank/db2:ro
+    mem_limit: 4g
+    healthcheck:
+      test: ["CMD-SHELL", "su - db2inst1 -c 'db2 connect to MYBANK >/dev/null && db2 connect reset >/dev/null'"]
+      interval: 30s
+      timeout: 30s
+      retries: 60
+      start_period: 300s
+
+  app:
+    build: ./app
+    image: mybank-app
+    depends_on:
+      db2:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: api
+      DB_HOST: db2
+      DB_PASSWORD: ${DB2INST1_PASSWORD}
+      LOADGEN_URL: http://loadgen:8081
+    ports:
+      - "8080:8080"
+    mem_limit: 640m
+
+  scheduler:
+    image: mybank-app
+    depends_on:
+      app:
+        condition: service_started
+    environment:
+      SPRING_PROFILES_ACTIVE: scheduler
+      DB_HOST: db2
+      DB_PASSWORD: ${DB2INST1_PASSWORD}
+    mem_limit: 320m
+
+  loadgen:
+    image: mybank-app
+    depends_on:
+      app:
+        condition: service_started
+    environment:
+      SPRING_PROFILES_ACTIVE: loadgen
+      LOADGEN_TARGET: http://app:8080
+      LOADGEN_TPS: ${LOADGEN_TPS:-10}
+    ports:
+      - "8081:8081"
+    mem_limit: 320m
+
+volumes:
+  db2data:

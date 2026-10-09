@@ -1,0 +1,7 @@
+.env
+.claude/settings.local.json
+target/
+*.class
+.idea/
+.vscode/
+.DS_Store
